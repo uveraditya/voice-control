@@ -7,9 +7,15 @@ import pyautogui
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
+import threading  # Ditambahkan untuk menangani thread skrol di latar belakang
+import datetime
+import json
 
 # Variabel global untuk menyimpan status perintah terakhir (untuk fitur "lagi")
 last_command_type = None
+# Variabel global tambahan
+is_scrolling_continuous = False
+scroll_thread = None
 
 # --- FUNGSI OUTPUT SUARA MENGGUNAKAN VOICEVOX API (BAHASA JEPANG) ---
 def speak_response(message):
@@ -56,7 +62,7 @@ def ask_ollama_and_speak(model_name, prompt_text):
             json={
                 "model": model_name,
                 "prompt": prompt_text,
-                "stream": False # Set True jika ingin model merespon secara streaming
+                "stream": False # Diubah menjadi False agar JSON response terbaca utuh
             }
         )
         
@@ -72,39 +78,303 @@ def ask_ollama_and_speak(model_name, prompt_text):
     except Exception as e:
         print(f"Error koneksi ke Ollama: {e}")
         speak_response("オラマとの接続に失敗しました。")
+        
+# --- FUNGSI ANALISIS PASAR (MODE INTERAKTIF SEPERTI KAIWA) ---
+def analyze_market_json(file_path, model_name="qwen3:8b"):
+    print(f"Membaca data pasar dari {file_path}...")
+    try:
+        if not os.path.exists(file_path):
+            speak_response("ファイルが見つかりませんでした。")
+            print(f"File {file_path} tidak ditemukan.")
+            return
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+            
+        # Format data JSON menjadi string untuk konteks sistem
+        data_string = json.dumps(json_data, ensure_ascii=False, indent=2)
+        
+        speak_response("市場分析モードを開始します。経済データについて何でも聞いてください！")
+        print("\n--- Memulai Mode Analisis Pasar Interaktif (Katakan 'stop', 'selesai', atau 'keluar' untuk kembali) ---")
+        
+        # Inisialisasi riwayat percakapan dengan role system pakar ekonomi
+        market_history = [
+            {
+                "role": "system", 
+                "content": (
+                    "Anda adalah seorang pakar ekonomi profesional dan analis pasar yang berpengalaman. "
+                    "Anda memiliki akses ke data pasar berikut:\n\n"
+                    f"{data_string}\n\n"
+                    "Rules:\n"
+                    "1. Jawab pertanyaan pengguna berdasarkan data pasar di atas secara mendalam, objektif, dan komprehensif.\n"
+                    "2. Berikan wawasan mengenai tren, risiko, peluang, serta rekomendasi strategis.\n"
+                    "3. Berikan respons dalam bahasa Indonesia yang profesional namun mudah dipahami."
+                )
+            },
+            {
+                "role": "assistant",
+                "content": "Halo! Saya telah membaca data pasar dari market_data.json. Ada bagian tren, risiko, atau strategi tertentu yang ingin Anda diskusikan?"
+            }
+        ]
+        
+        while True:
+            print("\n[Pasar Analisis Mendengarkan...] Silakan bicara...")
+            duration = 6 
+            sample_rate = 18000
+            audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
+            sd.wait() 
+            
+            filename = "temp_market.wav"
+            wav.write(filename, sample_rate, audio_data)
+
+            user_speech = ""
+            try:
+                import speech_recognition as sr
+                r = sr.Recognizer()
+                with sr.AudioFile(filename) as source:
+                    audio = r.record(source)
+                    user_speech = r.recognize_google(audio, language="id-ID")
+                    print(f"Anda (Analisis Pasar): \"{user_speech}\"")
+            except Exception:
+                print("Gagal mengenali suara, silakan coba lagi...")
+                if os.path.exists(filename):
+                    os.remove(filename)
+                continue
+                
+            if os.path.exists(filename):
+                os.remove(filename)
+                
+            # Periksa perintah keluar
+            lower_user_speech = user_speech.lower()
+            exit_keywords = ["stop", "selesai", "keluar", "nonaktifkan", "hentikan", "non aktifkan"]
+            if any(keyword in lower_user_speech for keyword in exit_keywords):
+                speak_response("市場分析モードを終了します。")
+                print("--- Keluar dari Mode Analisis Pasar ---")
+                break
+                
+            # Tambahkan input pengguna ke riwayat JSON
+            market_history.append({"role": "user", "content": user_speech})
+            
+            print(f"Mengirim data ke model ({model_name})...")
+            try:
+                response = requests.post(
+                    "http://localhost:11434/api/chat",
+                    json={
+                        "model": model_name,
+                        "messages": market_history,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.7,
+                            "top_p": 0.9
+                        }
+                    }
+                )
+                
+                if response.status_code == 200:
+                    res_json = response.json()
+                    reply_text = res_json.get("message", {}).get("content", "")
+                    
+                    # Simpan respon asisten ke riwayat JSON
+                    market_history.append({"role": "assistant", "content": reply_text})
+                    
+                    print(f"\n[Hasil Analisis Pakar Ekonomi]:\n{reply_text}")
+                    
+                    # Bacakan ringkasan awal hasil analisis menggunakan VOICEVOX
+                    speak_response(reply_text[:150] + "...") 
+                else:
+                    print("Gagal mendapatkan respons JSON dari Ollama.")
+                    speak_response("経済分析の取得に失敗しました。")
+            except Exception as e:
+                print(f"Error koneksi JSON Ollama: {e}")
+                speak_response("オラマとの接続に失敗しました。")
+            
+    except Exception as e:
+        print(f"Error saat menganalisis file JSON: {e}")
+        speak_response("JSONファイルの読み込みまたは分析中にエラーが発生しました。")
+
+# --- FUNGSI WORKER UNTUK SKROL DI LATAR BELAKANG ---
+def continuous_scroll_worker(direction):
+    global is_scrolling_continuous
+    scroll_amount = -30 if direction == "down" else 30
+    while is_scrolling_continuous:
+        pyautogui.scroll(scroll_amount)
+        time.sleep(0.05)
+
+def start_scrolling(direction):
+    global is_scrolling_continuous, scroll_thread
+    # Jika sudah berjalan, matikan dulu thread sebelumnya
+    if is_scrolling_continuous:
+        is_scrolling_continuous = False
+        if scroll_thread and scroll_thread.is_alive():
+            scroll_thread.join()
+            
+    is_scrolling_continuous = True
+    scroll_thread = threading.Thread(target=continuous_scroll_worker, args=(direction,))
+    scroll_thread.daemon = True
+    scroll_thread.start()
 
 # --- EKSEKUTOR PERINTAH KONTROL PC & SETTINGS ---
 def execute_command(command_text):
-    global last_command_type
+    global last_command_type, is_scrolling_continuous
     text = command_text.lower()
     print(f"\n[Perintah Diterima]: {text}")
 
-    # 1. Kontrol Mouse (Scroll) & Navigasi Jendela / Tab
-    if "scroll bawah" in text or "turunkan" in text or "ke bawah" in text:
+    # Deteksi perintah untuk menghentikan skrol
+    if "stop" in text or "yamete" in text or "berhenti" in text:
+        is_scrolling_continuous = False
+        speak_response("スクロールを停止します。")
+        return
+
+    # 1. Fitur Waktu, Tanggal, dan Jadwal
+    elif "jam berapa" in text or "waktu" in text or "pukul" in text:
+        now = datetime.datetime.now()
+        jam = now.strftime("%H:%M")
+        speak_response(f"現在の時刻は {jam} です。")
+        print(f"Jam saat ini: {jam}")
+
+    elif "tanggal berapa" in text or "hari apa" in text:
+        now = datetime.datetime.now()
+        hari = now.strftime("%A, %d %B %Y")
+        speak_response(f"今日は {hari} です。")
+        print(f"Hari ini: {hari}")
+
+    elif "jadwal" in text or "agenda" in text:
+        try:
+            with open("jadwal.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                agenda_hari_ini = data.get("hari_ini", "Tidak ada agenda hari ini.")
+                speak_response("本日のスケジュールをお伝えします。")
+                ask_ollama_and_speak("qwen3:8b", f"Ringkas dan bacakan jadwal berikut untuk kantor: {agenda_hari_ini}")
+        except FileNotFoundError:
+            speak_response("スケジュールファイルが見つかりませんでした。")
+    # Integrasi Analisis Pasar Interaktif dari market_data.json
+    elif "analisis pasar" in text or "analisa pasar" in text or "analisis ekonomi" in text or "analisis json" in text:
+        target_file = "market_data.json"
+        analyze_market_json(target_file, model_name="qwen3:8b")
+
+    # Integrasi Analisis Pasar Interaktif dari market_data.json
+    elif "analisis pasar" in text or "analisis ekonomi" in text or "analisis json" in text:
+        target_file = "market_data.json"
+        analyze_market_json(target_file, model_name="qwen3:8b")
+
+    # Integrasi Kaiwa Partner - Mode Penutur Asli Jepang (Native Speaker Style) dengan Perbaikan Keluar Mode
+    elif "aktifkan percakapan ai" in text or "kaiwa" in text:
+        speak_response("日本語の会話モードを開始します。ネイティブのように話しましょう！")
+        print("\n--- Memulai Mode Kaiwa Native Speaker (Katakan 'stop', 'selesai', 'nonaktifkan percakapan', atau 'hentikan kaiwa' untuk keluar) ---")
+        
+        # Inisialisasi riwayat percakapan dengan role system native Jepang
+        kaiwa_history = [
+            {
+                "role": "system", 
+                "content": (
+                    "You are a native Japanese speaker and a warm, natural conversation partner. "
+                    "Your goal is to converse with the user just like a real Japanese person in daily life.\n"
+                    "Rules:\n"
+                    "1. Always respond in authentic, natural Japanese (1-3 sentences) using conversational phrasing, idioms, and native reactions (e.g., えー、マジで？, なるほどね, よね～, etc.) where appropriate.\n"
+                    "2. Insert Furigana for ALL Kanji using the format Kanji[furigana]. Example: 私[わたし]は 日本[にほん]に 住[す]んでいます。\n"
+                    "3. Insert commas (、) frequently for natural pacing and pauses.\n"
+                    "4. Gently and naturally correct any user grammar or vocabulary mistakes by incorporating the corrected form smoothly in your response or explaining it briefly.\n"
+                    "5. Provide a clear, natural Indonesian translation and a brief natural nuance/grammar note after the delimiter '---TRANSLATION---'."
+                )
+            }
+        ]
+        
+        while True:
+            print("\n[Kaiwa Mendengarkan...] Silakan bicara...")
+            duration = 6 
+            sample_rate = 18000
+            audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
+            sd.wait() 
+            
+            filename = "temp_kaiwa.wav"
+            wav.write(filename, sample_rate, audio_data)
+
+            user_speech = ""
+            try:
+                import speech_recognition as sr
+                r = sr.Recognizer()
+                with sr.AudioFile(filename) as source:
+                    audio = r.record(source)
+                    user_speech = r.recognize_google(audio, language="id-ID")
+                    print(f"Anda (Kaiwa): \"{user_speech}\"")
+            except Exception:
+                print("Gagal mengenali suara, silakan coba lagi...")
+                if os.path.exists(filename):
+                    os.remove(filename)
+                continue
+                
+            if os.path.exists(filename):
+                os.remove(filename)
+                
+            # Periksa perintah keluar yang lebih komprehensif (termasuk nonaktifkan/hentikan)
+            lower_user_speech = user_speech.lower()
+            exit_keywords = ["stop", "selesai", "keluar", "nonaktifkan", "hentikan", "non aktifkan"]
+            if any(keyword in lower_user_speech for keyword in exit_keywords):
+                speak_response("会話モードを終了します。お疲れ様でした！またおしゃべりしましょうね。")
+                print("--- Keluar dari Mode Kaiwa ---")
+                break
+                
+            # Tambahkan input pengguna ke riwayat JSON
+            kaiwa_history.append({"role": "user", "content": user_speech})
+            
+            print("Mengirim data ke model (qwen3:8b) dengan gaya native...")
+            try:
+                response = requests.post(
+                    "http://localhost:11434/api/chat",
+                    json={
+                        "model": "qwen3:8b",
+                        "messages": kaiwa_history,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.8,
+                            "top_p": 0.9
+                        }
+                    }
+                )
+                
+                if response.status_code == 200:
+                    res_json = response.json()
+                    reply_text = res_json.get("message", {}).get("content", "")
+                    
+                    # Simpan respon asisten ke riwayat JSON
+                    kaiwa_history.append({"role": "assistant", "content": reply_text})
+                    
+                    print(f"\n[AI Native Kaiwa Response]:\n{reply_text}")
+                    
+                    # Pisahkan teks bahasa Jepang dan terjemahan Indonesia
+                    parts = reply_text.split("---TRANSLATION---")
+                    japanese_part = parts[0].strip()
+                    
+                    # Bersihkan format furigana Kanji[...] untuk dibaca VOICEVOX
+                    import re
+                    clean_speech = re.sub(r'\[[^\]]+\]', '', japanese_part)
+                    clean_speech = clean_speech.replace('\n', ' ')
+                    
+                    # Ucapkan hanya bagian bahasa Jepang menggunakan VOICEVOX
+                    speak_response(clean_speech)
+                else:
+                    print("Gagal mendapatkan respons JSON dari Ollama.")
+            except Exception as e:
+                print(f"Error koneksi JSON Ollama: {e}")
+
+    # 2. Kontrol Mouse (Scroll) & Navigasi Jendela / Tab
+    elif "scroll bawah" in text or "turunkan" in text or "ke bawah" in text:
         last_command_type = "down"
-        speak_response("ゆっくり下にスクロールしています。")
-        for _ in range(15):
-            pyautogui.scroll(-30)
-            time.sleep(0.05)
+        speak_response("下にスクロールし続けます。「ストップ」と言うまで続きます。")
+        start_scrolling("down")
 
     elif "scroll atas" in text or "naikkan" in text or "ke atas" in text:
         last_command_type = "up"
-        speak_response("ゆっくり上にスクロールしています。")
-        for _ in range(15):
-            pyautogui.scroll(30)
-            time.sleep(0.05)
+        speak_response("上にスクロールし続けます。「ストップ」と言うまで続きます。")
+        start_scrolling("up")
 
     elif "lagi" in text:
         if last_command_type == "down":
             speak_response("続けて下にスクロールします。")
-            for _ in range(15):
-                pyautogui.scroll(-30)
-                time.sleep(0.05)
+            start_scrolling("down")
         elif last_command_type == "up":
             speak_response("続けて上にスクロールします。")
-            for _ in range(15):
-                pyautogui.scroll(30)
-                time.sleep(0.05)
+            start_scrolling("up")
         else:
             speak_response("繰り返すスクロールの履歴がありません。")
             
@@ -128,7 +398,7 @@ def execute_command(command_text):
         speak_response("タスクマネージャーを閉じます。")
         os.system("taskkill /f /im Taskmgr.exe")
         
-    # 2. Web & Aplikasi Shortcut (Desktop & Web)
+    # 3. Web & Aplikasi Shortcut (Desktop & Web)
     elif "vocalvox" in text or "vocal" in text or "vox" in text:
         speak_response("ボイスボックスを開きます。")
         os.system('start "" "C:\\Program Files\\VOICEVOX\\VOICEVOX.exe"')
@@ -258,7 +528,7 @@ def execute_command(command_text):
     elif "ollama" in text or "ai" in text or "model" in text:
         if "qwen" in text or "kuen" in text:
             speak_response("Qwenモデルに聞いています。")
-            ask_ollama_and_speak("qwen2.5-coder:14b", command_text)
+            ask_ollama_and_speak("qwen3:8b", command_text)
         elif "deepseek" in text or "ディープシーク" in text:
             speak_response("DeepSeekモデルに聞いています。")
             ask_ollama_and_speak("deepseek-r1:14b", command_text)
@@ -290,7 +560,7 @@ def execute_command(command_text):
         speak_response("コマンドプロンプトを開きます。")
         subprocess.Popen("start cmd", shell=True)
 
-    # 3. Fungsi Windows Settings
+    # 4. Fungsi Windows Settings
     elif "setting" in text or "pengaturan" in text:
         if "system" in text or "sistem" in text:
             speak_response("システム設定を開きます。")
@@ -342,7 +612,7 @@ def execute_command(command_text):
 def record_and_transcribe():
     duration = 5 
     sample_rate = 18000
-    print("\n--- Mendengarkan suara Anda (Silakan bicara selama 10 detik)... ---")
+    print("\n--- Mendengarkan suara Anda (Silakan bicara selama 5 detik)... ---")
     
     audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
     sd.wait() 
